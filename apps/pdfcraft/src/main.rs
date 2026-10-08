@@ -1,11 +1,13 @@
 //! PdfCraft desktop app.
 //!
 //! Usage: `pdfcraft [options] [files…]`
+//! `--create-images [images…]` stages the images in one PDF and asks for the page DPI.
 //!
 //! View options (applied after the files open; also the seed of the UI control channel):
 //! `--page N  --zoom 150  --layout continuous|two-up|single  --panel comments|bookmarks|pages|fields|layers|attachments|none
-//!  --theme light|dark  --language auto|<code>  --mode all|read|edit|convert|sign  --tool <catalogue id>  --left open|closed
-//!  --organize on  --fields on  --dialog properties|shortcuts|about  --palette <query>  --home on`
+//!  --theme light|dark|system  --language auto|<code>  --mode all|read|edit|convert|sign  --tool <catalogue id>  --left open|closed
+//!  --organize on  --fields on  --dialog properties|shortcuts|about  --palette <query>  --home on
+//!  --cover on|off  --default-layout continuous|two-up|single  --default-zoom fit-width|fit-page|<percent>`
 //!
 //! `--control <file>` enables the UI control channel (off by default): the app listens on a random
 //! loopback port and writes `{"port", "token", "pid"}` to `<file>` (owner-only permissions).
@@ -21,6 +23,7 @@ use pdfcraft_ui_egui::PdfCraftApp;
 
 #[cfg(target_os = "macos")]
 mod apple_events;
+mod logging;
 mod updates;
 
 /// Freedesktop app id: the `.desktop` file name and the hicolor icon name.
@@ -36,11 +39,17 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256
 /// The app was called PrintCraft before; settings saved then are under this key.
 const LEGACY_STORAGE_KEY: &str = "printcraft";
 
+/// The settings folder: `app.ron` and the `logs` folder (docs/development.md). eframe would
+/// otherwise derive it from the app id; keep it under "PdfCraft".
+fn settings_dir() -> Option<std::path::PathBuf> {
+    eframe::storage_dir("PdfCraft")
+}
+
 /// Move the settings and crash-recovery folders of the app's former name, PrintCraft, to the new
 /// name once, so an upgrade keeps recent files, preferences and unsaved work. Best effort: a
 /// folder is left alone when the new one already exists or the move fails.
 fn migrate_legacy_folders() {
-    let mut moves = vec![(eframe::storage_dir("PrintCraft"), eframe::storage_dir("PdfCraft"))];
+    let mut moves = vec![(eframe::storage_dir("PrintCraft"), settings_dir())];
     // Recovery lives in the settings folder except on Windows, where it is under %LOCALAPPDATA%.
     if cfg!(windows) {
         let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
@@ -54,25 +63,37 @@ fn migrate_legacy_folders() {
         if let Some(parent) = new.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::rename(&old, &new) {
-            eprintln!("pdfcraft: moving {} to {}: {e}", old.display(), new.display());
+        match std::fs::rename(&old, &new) {
+            Ok(()) => log::info!("moved {} to {}", old.display(), new.display()),
+            Err(e) => log::warn!("moving {} to {}: {e}", old.display(), new.display()),
         }
     }
 }
 
 fn main() -> eframe::Result {
+    // First, so the panic hook and every start-up warning are recorded (`logging`).
+    let logger = logging::install();
     // Last-resort guard (AGENTS.md §4): commands, edits, opens and saves catch panics and report
     // them; this hook logs every panic, caught or not, with a backtrace when RUST_BACKTRACE is set.
     std::panic::set_hook(Box::new(|info| {
-        eprintln!("pdfcraft: internal error: {info}");
         let trace = std::backtrace::Backtrace::capture();
-        if trace.status() == std::backtrace::BacktraceStatus::Captured {
-            eprintln!("{trace}");
+        let report = if trace.status() == std::backtrace::BacktraceStatus::Captured {
+            format!("internal error: {info}\n{trace}")
+        } else {
+            format!("internal error: {info}")
+        };
+        // Standard error and the log file; standard error alone when RUST_LOG turned errors off.
+        if log::log_enabled!(log::Level::Error) {
+            log::error!("{report}");
+        } else {
+            // `eprintln!` panics on a broken stderr pipe, and a panic inside the panic hook aborts.
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("pdfcraft: {report}\n"));
         }
     }));
     let mut files = Vec::new();
     let mut options: Vec<(String, String)> = Vec::new();
     let mut control_file: Option<String> = None;
+    let mut create_images = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -81,6 +102,7 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--control" => control_file = args.next(),
+            "--create-images" => create_images = true,
             flag if flag.starts_with("--") => {
                 let value = args.next().unwrap_or_default();
                 options.push((flag.trim_start_matches("--").to_string(), value));
@@ -99,14 +121,23 @@ fn main() -> eframe::Result {
     // Dock, taskbar, Alt-Tab and launcher icon when running unbundled.
     match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
         Ok(icon) => viewport = viewport.with_icon(icon),
-        Err(e) => eprintln!("pdfcraft: app icon: {e}"),
+        Err(e) => log::warn!("app icon: {e}"),
     }
     if integrated {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
     migrate_legacy_folders();
-    // eframe would otherwise derive the settings folder from the app id: keep it under "PdfCraft".
-    let persistence_path = eframe::storage_dir("PdfCraft").map(|d| d.join("app.ron"));
+    // The log file lives in the settings folder; opened after the arguments (so `--version` leaves
+    // no file behind) and after the PrintCraft migration (which a fresh folder would block).
+    // Records logged until now are written to it first.
+    if let (Some(logger), Some(dir)) = (logger, settings_dir()) {
+        match logger.attach_dir(&dir.join("logs")) {
+            Ok(path) => log::info!("PdfCraft {}, log file {}", env!("CARGO_PKG_VERSION"), path.display()),
+            // Standard error only by now (`attach_dir` gave up on the file); unlike `eprintln!`, never panics.
+            Err(e) => log::warn!("no log file: {e}"),
+        }
+    }
+    let persistence_path = settings_dir().map(|d| d.join("app.ron"));
     let mut native = eframe::NativeOptions { viewport, persistence_path, ..Default::default() };
     configure_gpu(&mut native);
     // Finder, Open With and the Dock deliver files as Apple events, not arguments; catch the one
@@ -125,7 +156,7 @@ fn main() -> eframe::Result {
             }
             app.integrated_titlebar = integrated;
             app.update_source = Some(std::sync::Arc::new(updates::latest_release));
-            app.keychain_ids = cfg!(target_os = "macos");
+            app.os_key_store_ids = cfg!(any(target_os = "macos", target_os = "windows"));
             #[cfg(target_os = "macos")]
             {
                 app.os_events = Some(apple_events.connect(&cc.egui_ctx));
@@ -133,20 +164,27 @@ fn main() -> eframe::Result {
             if let Some(file) = &control_file {
                 let client = app.attach_control(&cc.egui_ctx);
                 match pdfcraft_ui_egui::control::serve(client).and_then(|ep| write_control_file(file, ep.port, &ep.token).map(|()| ep.port)) {
-                    Ok(port) => eprintln!("pdfcraft: UI control channel on 127.0.0.1:{port} (connection details in {file})"),
-                    Err(e) => eprintln!("pdfcraft: --control {file}: {e}"),
+                    // Never the token (AGENTS.md §3): it stays in the owner-only file.
+                    Ok(port) => log::info!("UI control channel on 127.0.0.1:{port} (connection details in {file})"),
+                    Err(e) => log::error!("--control {file}: {e}"),
                 }
             }
             // Autosave unsaved changes; offer to recover documents a crashed session left behind.
             if let Some(dir) = pdfcraft_ui_egui::RecoveryStore::default_dir() {
                 app.enable_recovery(pdfcraft_ui_egui::RecoveryStore::new(dir));
             }
-            for f in files {
-                app.open_path(&f);
+            if create_images {
+                if let Err(e) = app.begin_image_import_paths(&files) {
+                    app.notify(e);
+                }
+            } else {
+                for f in files {
+                    app.open_path(&f);
+                }
             }
             for (k, v) in options {
                 if let Err(e) = app.set_option(&k, &v) {
-                    eprintln!("pdfcraft: --{k} {v}: {e}");
+                    log::warn!("--{k} {v}: {e}");
                 }
             }
             Ok(Box::new(app))

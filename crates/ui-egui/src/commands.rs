@@ -7,11 +7,18 @@
 use pdfcraft_engine::Edit;
 use pdfcraft_engine::commands::{self, COMMANDS, CommandSpec};
 
-use crate::{Dialog, Mode, PdfCraftApp, PropsTab, RightPanel, SaveTarget, theme::ThemeKind, widgets};
+use crate::{
+    Dialog, Mode, PdfCraftApp, PropsTab, RightPanel, SaveTarget,
+    theme::{ThemeKind, ThemePreference},
+    widgets,
+};
 
 impl PdfCraftApp {
+    /// Whether a registered command can run now. The engine judges the document (security,
+    /// contents, undo history); view state it can't see is checked here.
     pub(crate) fn command_enabled(&self, spec: &CommandSpec) -> bool {
         commands::is_enabled(spec, &self.session, self.active_ids().map(|(_, id)| id))
+            && (spec.needs != commands::Needs::TwoPageView || self.active.and_then(|i| self.views.get(i)).is_some_and(crate::DocView::cover_applies))
     }
 
     /// Run a registered command by id. Returns `false` when the id is unknown or the command
@@ -59,6 +66,7 @@ impl PdfCraftApp {
                 commands::Needs::Assembly | commands::Needs::Modification | commands::Needs::Annotate if self.active.is_some() => {
                     tl!("The document's security settings don't allow this change").to_string()
                 }
+                commands::Needs::TwoPageView if self.active.is_some() => tl!("Switch to two-page view first to show the cover page").to_string(),
                 _ => tl!("Open a document first").to_string(),
             };
             self.notify(why);
@@ -116,6 +124,25 @@ impl PdfCraftApp {
                 }
             }
             "view.palette" => self.palette_open = !self.palette_open,
+            layout if crate::canvas::PageLayout::from_command(layout).is_some() => {
+                if let (Some(i), Some(layout)) = (active, crate::canvas::PageLayout::from_command(layout)) {
+                    self.views[i].set_layout(layout);
+                }
+            }
+            "view.layout.cover" => {
+                if let Some(i) = active {
+                    let v = &mut self.views[i];
+                    v.set_cover(!v.cover);
+                }
+            }
+            "view.fit_width_scrolling" | "view.fit_one_page" => {
+                use crate::canvas::{Fit, PageLayout};
+                let (layout, fit) = if id == "view.fit_one_page" { (PageLayout::Single, Fit::Page) } else { (PageLayout::Continuous, Fit::Width) };
+                if let Some(i) = active {
+                    self.views[i].set_layout(layout);
+                    self.views[i].set_fit(fit);
+                }
+            }
             "view.full_screen" => {
                 let on = !self.full_screen;
                 match self.ctx.clone() {
@@ -125,12 +152,13 @@ impl PdfCraftApp {
             }
             "view.read_mode" => self.mode = if self.mode == Mode::Read { Mode::AllTools } else { Mode::Read },
             "view.theme" => {
-                let next = if self.theme == ThemeKind::Light { ThemeKind::Dark } else { ThemeKind::Light };
-                match self.ctx.clone() {
-                    Some(ctx) => self.set_theme(&ctx, next),
-                    None => self.theme = next,
-                }
+                let next = if self.theme == ThemeKind::Light { ThemePreference::Dark } else { ThemePreference::Light };
+                self.set_theme_preference(next);
             }
+            command if command.starts_with("measure.") => crate::measure_ui::command(self, command),
+            "view.theme.system" => self.set_theme_preference(ThemePreference::System),
+            "view.theme.light" => self.set_theme_preference(ThemePreference::Light),
+            "view.theme.dark" => self.set_theme_preference(ThemePreference::Dark),
             "comment.list" => self.right = Some(RightPanel::Comments),
             tool if crate::comments::CommentTool::from_command(tool).is_some() => {
                 let Some(tool) = crate::comments::CommentTool::from_command(tool) else { return false };
@@ -159,10 +187,10 @@ impl PdfCraftApp {
                 self.apply_edit(Edit::Flatten { comments: true, fields: false });
             }
             "form.flatten" => {
-                if let Some(i) = active {
-                    self.views[i].forms.focus = None;
+                // Flatten what's typed in a field too (#166); a refused value flattens nothing.
+                if self.commit_form_typing() {
+                    self.apply_edit(Edit::Flatten { comments: false, fields: true });
                 }
-                self.apply_edit(Edit::Flatten { comments: false, fields: true });
             }
             "form.clear" => {
                 if let Some(i) = active {
@@ -475,6 +503,11 @@ impl PdfCraftApp {
     pub(crate) fn registry_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let typing = ctx.egui_wants_keyboard_input();
+        // A form field's editor is open on the page: its text isn't in the document until
+        // committed. (Not egui's keyboard focus: an Escape in this frame has already cleared that,
+        // while the field has yet to see the Escape and discard its draft.)
+        let active = self.active_ids();
+        let form_typing = active.and_then(|(i, _)| self.views.get(i)).is_some_and(|v| v.forms.focus.is_some());
         let mut specs: Vec<&CommandSpec> = COMMANDS.iter().filter(|c| c.shortcut.is_some()).collect();
         specs.sort_by_key(|c| std::cmp::Reverse(c.shortcut.map(|s| s.modifier_count()).unwrap_or(0)));
         for spec in specs {
@@ -494,7 +527,15 @@ impl PdfCraftApp {
                 m |= Modifiers::CTRL;
             }
             if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, key))) {
-                self.execute(spec.id);
+                if form_typing {
+                    // A form field has the keyboard: let it take this frame's typing (and
+                    // Escape) first, so ⌘S saves what's on screen (#166). Runs next frame, for
+                    // this document only.
+                    self.deferred_commands.push((spec.id, active.map(|(_, id)| id)));
+                    ctx.request_repaint();
+                } else {
+                    self.execute(spec.id);
+                }
             }
         }
     }

@@ -18,6 +18,7 @@ mod forms;
 mod links;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+mod measure;
 mod printing;
 mod redact;
 mod signing;
@@ -525,6 +526,14 @@ impl Automation {
             "doc_print" => self.doc_print(&a)?,
             "doc_remove_hidden" => self.doc_remove_hidden(&a)?,
             "fill_sign_add" => self.fill_sign_add(&a)?,
+            "measure_distance" => self.measurement_add(&a, pdfcraft_engine::measure::Kind::Distance)?,
+            "measure_perimeter" => self.measurement_add(&a, pdfcraft_engine::measure::Kind::Perimeter)?,
+            "measure_area" => self.measurement_add(&a, pdfcraft_engine::measure::Kind::Area)?,
+            "measure_info" => self.measurement_info(&a)?,
+            "measure_list" => self.measurement_list(&a)?,
+            "measure_scale" => self.measurement_scale(&a)?,
+            "measure_snap" => self.measurement_snap(&a)?,
+            "measure_export" => self.measurement_export(&a)?,
             "comment_list" => self.comment_list(&a)?,
             "comment_add" => self.comment_add(&a)?,
             "stamp_custom" => self.stamp_custom(&a)?,
@@ -569,6 +578,17 @@ impl Automation {
                 let ids: Vec<Value> = Vec::new();
                 json!({ "count": ids.len(), "ids": ids })
             }
+            "sign_windows_ids" => {
+                #[cfg(target_os = "windows")]
+                let ids: Vec<Value> = pdfcraft_engine::sign::windows::identities()
+                    .map_err(failed)?
+                    .iter()
+                    .map(|id| json!({ "id": pdfcraft_engine::sign::windows::reference(&id.certificate), "certificate": signing::cert_json(&id.certificate) }))
+                    .collect();
+                #[cfg(not(target_os = "windows"))]
+                let ids: Vec<Value> = Vec::new();
+                json!({ "count": ids.len(), "ids": ids })
+            }
             "sign_trust" => self.sign_trust(&a)?,
             "comment_mark" => self.comment_mark(&a)?,
             "comment_lock" => self.comment_lock(&a)?,
@@ -601,7 +621,8 @@ impl Automation {
     fn doc_close(&mut self, a: &Args) -> Result<Value> {
         let doc = self.doc(a)?;
         let id = doc.id;
-        if doc.dirty && !a.opt_bool("discard_changes")?.unwrap_or(false) {
+        let discard_changes = a.opt_bool("discard_changes")?.unwrap_or(false);
+        if doc.dirty && !discard_changes {
             return Err(failed("the document has unsaved changes: save it with doc_save, or pass discard_changes: true"));
         }
         self.session.close(id);
@@ -961,6 +982,7 @@ impl Automation {
                 ("Untitled.pdf".to_string(), self.session.create_blank(w, h, n).map_err(failed)?)
             }
             "images" => {
+                let resolution = a.opt_num("dpi")?.map_or(pdfcraft_engine::ImageResolution::Embedded, pdfcraft_engine::ImageResolution::Dpi);
                 let mut images = Vec::new();
                 for p in a.strs("paths")? {
                     let path = self.resolve(p, false)?;
@@ -972,7 +994,7 @@ impl Automation {
                 } else {
                     "Images.pdf".into()
                 };
-                (name, self.session.create_from_images(&images).map_err(failed)?)
+                (name, self.session.create_from_images_with_resolution(&images, resolution).map_err(failed)?)
             }
             "text" => {
                 let (title, text) = match (a.opt_str("text")?, a.opt_str("path")?) {
@@ -1035,6 +1057,15 @@ impl Automation {
     fn doc_protect(&mut self, a: &Args) -> Result<Value> {
         use pdfcraft_engine::{Algorithm, Changes, Printing, Protection};
         let d = Protection::default();
+        // Restrictions only exist behind a permissions password (ISO 32000-2 §7.6.4.4: /P is
+        // enforced against the owner password; without one everything stays allowed). Refuse a
+        // restriction that could not take effect instead of writing an unrestricted file (#134).
+        let restriction = ["printing", "changes", "copy", "accessibility"].into_iter().find(|k| a.get(k).is_some());
+        if let (None, Some(key)) = (a.opt_str("permissions_password")?, restriction) {
+            return Err(ToolError::InvalidArgs(format!(
+                "`{key}` needs `permissions_password`: with open_password alone the document is encrypted but nothing is restricted"
+            )));
+        }
         let p = Protection {
             open_password: a.opt_str("open_password")?.map(str::to_owned),
             permissions_password: a.opt_str("permissions_password")?.map(str::to_owned),
@@ -1557,26 +1588,44 @@ fn info(d: &Document) -> Value {
         "creator": i.creator, "producer": i.producer,
         "tagged": i.tagged,
         "has_javascript": i.has_javascript,
-        // XFA forms aren't read yet: "static" (fields work, XFA data ignored) or "dynamic" (placeholder pages).
+        // XFA forms: "static" (the PDF's own fields work; the XFA data is ignored) or "dynamic"
+        // (laid out from the template by PdfCraft, see xfa_layout; placeholder pages when that failed).
         "xfa": i.xfa.map(|x| match x { pdfcraft_render::Xfa::Static => "static", pdfcraft_render::Xfa::Dynamic => "dynamic" }),
+        "xfa_layout": d.xfa.as_ref().map(|x| json!({ "pages": x.pages, "fields": x.fields, "warnings": x.warnings })),
+        // What was rewritten from, or could not be written to, the XFA data.
+        "xfa_warnings": d.xfa_warnings,
         "security": security,
         "pages": i.pages.iter().enumerate().map(|(n, p)| json!({
             "page": n + 1, "label": p.label, "width": p.width, "height": p.height, "rotation": p.rotation,
         })).collect::<Vec<_>>(),
         "outline": outline(&i.outline),
+        // Rectangles use the tools' convention (top-left of the displayed page, like
+        // comment_list and link_list), not raw PDF user space, so they can be fed back to
+        // geometry-taking tools (#129).
         "annotations": i.annotations.iter().map(|a| json!({
             "page": page1(a.page), "type": a.subtype, "author": a.author, "contents": a.contents,
-            "modified": a.modified, "name": a.name, "in_reply_to": a.in_reply_to, "rect": a.rect,
+            "modified": a.modified, "name": a.name, "in_reply_to": a.in_reply_to, "rect": view_rect(i, a.page, a.rect),
         })).collect::<Vec<_>>(),
         "fields": i.fields.iter().map(|f| json!({
             "name": f.name, "kind": format!("{:?}", f.kind), "value": f.value, "page": f.page.map(page1),
             "tooltip": f.tooltip, "has_actions": f.has_actions,
         })).collect::<Vec<_>>(),
         "links": i.links.iter().map(|l| json!({
-            "page": page1(l.page), "rect": l.rect,
+            "page": page1(l.page), "rect": view_rect(i, l.page, l.rect),
             "target": match &l.target {
                 pdfcraft_render::LinkTarget::Page(p) => json!({ "page": page1(*p) }),
                 pdfcraft_render::LinkTarget::Uri(u) => json!({ "uri": u }),
+                pdfcraft_render::LinkTarget::SetLayers { changes, preserve_rb } => json!({
+                    "layers": changes.iter().map(|(op, ocg)| json!({
+                        "layer": i.layers.iter().find(|l| l.id == *ocg).map(|l| l.name.as_str()),
+                        "state": match op {
+                            pdfcraft_render::LayerOp::On => "on",
+                            pdfcraft_render::LayerOp::Off => "off",
+                            pdfcraft_render::LayerOp::Toggle => "toggle",
+                        },
+                    })).collect::<Vec<_>>(),
+                    "preserve_rb": preserve_rb,
+                }),
                 pdfcraft_render::LinkTarget::Other(o) => json!({ "other": o }),
             },
         })).collect::<Vec<_>>(),
@@ -1588,6 +1637,12 @@ fn info(d: &Document) -> Value {
         "warnings": i.warnings,
         "repairs": d.repair_log(),
     })
+}
+
+/// A user-space rectangle on 0-based `page` in displayed-page coordinates; unchanged when the
+/// page is unknown (a malformed annotation that points at no page).
+fn view_rect(i: &pdfcraft_render::DocInfo, page: usize, rect: [f32; 4]) -> [f32; 4] {
+    i.pages.get(page).map_or(rect, |p| comments::rect_to_view(p, rect))
 }
 
 fn outline(items: &[pdfcraft_render::OutlineItem]) -> Value {

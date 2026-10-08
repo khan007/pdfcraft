@@ -42,6 +42,16 @@ fn point() -> Value {
     json!({ "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "description": "[x, y] in points from the top-left of the displayed page." })
 }
 
+fn measure_points() -> Value {
+    json!({"type":"array","items":point(),"minItems":1,"maxItems":2048})
+}
+fn measure_schema() -> Value {
+    schema(
+        json!({"doc":doc(),"page":{"type":"integer","minimum":1},"points":measure_points(),"label":{"type":"string","maxLength":512},"author":{"type":"string","maxLength":512}}),
+        &["doc", "page", "points"],
+    )
+}
+
 fn color() -> Value {
     json!({ "type": "string", "description": "#RRGGBB or a name: yellow, red, orange, green, blue, purple, pink, black, gray, white." })
 }
@@ -479,6 +489,22 @@ pub fn tools() -> Vec<ToolDef> {
             .destructive()
             .cmd("edit.remove_links")
             .with(schema(json!({ "doc": doc() }), &["doc"])),
+        t("measure_distance", "Measure distance", "Add an undoable two-point distance annotation using the scale of the first point's viewport.")
+            .cmd("measure.distance").with(measure_schema()),
+        t("measure_perimeter", "Measure perimeter", "Add an undoable connected-line length annotation. To include a closing edge, repeat the first point at the end.")
+            .cmd("measure.perimeter").with(measure_schema()),
+        t("measure_area", "Measure area", "Add an undoable area annotation from a simple polygon. The last edge closes automatically.")
+            .cmd("measure.area").with(measure_schema()),
+        t("measure_info", "Read a measurement", "Calculate a live distance, perimeter or area, deltas, angle and scale without adding an annotation. Incomplete paths are allowed.")
+            .ro().cmd("measure.info").with(schema(json!({"doc":doc(),"page":{"type":"integer","minimum":1},"points":measure_points(),"type":{"type":"string","enum":["distance","perimeter","area"]}}), &["doc","page","points"])),
+        t("measure_list", "List measurements", "Saved measurement annotations with calculated values, scale and vertices in display coordinates. Measurements with unsupported imported formats (compound or fractional units, non-rectilinear scales) or invalid geometry are listed under unsupported with a reason.")
+            .ro().with(schema(json!({"doc":doc(),"page":{"type":"integer","minimum":1}}), &["doc"])),
+        t("measure_scale", "Set or read a measurement scale", "Read the scale at a point, or add a rectangular viewport using units_per_point or two calibration points and their real-world distance. Existing measurements retain their original scales. Undoable.")
+            .cmd("measure.scale").with(schema(json!({"doc":doc(),"page":{"type":"integer","minimum":1},"at":point(),"rect":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"name":{"type":"string"},"unit":{"type":"string"},"precision":{"type":"integer","minimum":0,"maximum":6},"units_per_point":{"type":"number","exclusiveMinimum":0},"points":measure_points(),"distance":{"type":"number","exclusiveMinimum":0}}), &["doc","page"])),
+        t("measure_snap", "Snap a measurement vertex", "Snap a point to vector paths, endpoints, midpoints or intersections. Coordinates and tolerance are in display points. Bounded extraction reports truncated geometry.")
+            .ro().cmd("measure.snap").with(schema(json!({"doc":doc(),"page":{"type":"integer","minimum":1},"at":point(),"tolerance":{"type":"number","minimum":0,"maximum":10000},"endpoints":{"type":"boolean"},"midpoints":{"type":"boolean"},"intersections":{"type":"boolean"},"paths":{"type":"boolean"}}), &["doc","page","at"])),
+        t("measure_export", "Export measurements as CSV", "Atomically write saved measurement values, labels, authors and scale ratios as spreadsheet-safe CSV. Returns how many unsupported measurements were left out.")
+            .cmd("measure.export").with(schema(json!({"doc":doc(),"out":path_arg()}), &["doc","out"])),
         t("comment_list", "List comments", "Every comment (annotation other than links, form widgets and pop-ups) with its page, index, id, type, author, text, date, rectangle, colour, review status and replies.")
             .ro()
             .with(schema(json!({ "doc": doc(), "page": { "type": "integer", "minimum": 1, "description": "Only this page." } }), &["doc"])),
@@ -544,16 +570,20 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             &["name", "password", "path"],
         )),
+        t("sign_windows_ids", "List Windows store digital IDs", "Windows: signing identities in the Current User Personal certificate store (certificate details and the windows: reference sign_document takes). Private keys remain in CNG; Windows may ask permission to use them.")
+            .ro()
+            .cmd("sign.digital")
+            .with(schema(json!({}), &[])),
         t("sign_keychain_ids", "List Keychain digital IDs", "macOS: the signing identities in the user's keychains (certificate details and the keychain: reference sign_document takes). The private keys stay in the Keychain, which may ask the user to allow their use.")
             .ro()
             .cmd("sign.digital")
             .with(schema(json!({}), &[])),
-        t("sign_document", "Sign a document", "Sign with a digital ID (a .p12/.pfx path, or on macOS a Keychain identity: \"keychain:<common name or fingerprint>\" from sign_keychain_ids) and save the signed file to `out` (signing always saves, as in Acrobat; the document then shows the signed file). Sign an existing empty signature field (`field`), or a new one on `page` at `rect` (omit rect for an invisible signature). certify: no_changes, form_fill or comments makes a certification signature. PAdES B-B, SHA-256 (SHA-384 for P-384 keys).")
+        t("sign_document", "Sign a document", "Sign with a digital ID (a .p12/.pfx path, or on macOS a Keychain identity: \"keychain:<common name or fingerprint>\" from sign_keychain_ids, or on Windows a store identity: \"windows:<common name or fingerprint>\" from sign_windows_ids) and save the signed file to `out` (signing always saves, as in Acrobat; the document then shows the signed file). Sign an existing empty signature field (`field`), or a new one on `page` at `rect` (omit rect for an invisible signature). certify: no_changes, form_fill or comments makes a certification signature. PAdES B-B, SHA-256 (SHA-384 for P-384 keys).")
             .cmd("sign.digital")
             .with(schema(
                 json!({
                     "doc": doc(),
-                    "id": { "type": "string", "description": "Path of the digital ID (.p12 / .pfx)." },
+                    "id": { "type": "string", "description": "Digital ID file (.p12 / .pfx), keychain: reference on macOS, or windows: reference on Windows." },
                     "password": { "type": "string" },
                     "field": { "type": "string" },
                     "page": { "type": "integer", "minimum": 1 },
@@ -602,18 +632,18 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "doc_protect",
             "Protect with passwords",
-            "Encrypt the document (applied by the next doc_save, a full rewrite). open_password is needed to open it; permissions_password is needed to change security and lifts the restrictions given by printing/changes/copy. Passwords are never echoed back. Undoable.",
+            "Encrypt the document (applied by the next doc_save, a full rewrite). open_password is needed to open it. permissions_password is needed to change security and lifts the restrictions given by printing/changes/copy/accessibility; those restrictions (and their defaults) apply only when permissions_password is given. With open_password alone the document is encrypted and everything stays allowed, so passing a restriction without permissions_password is an error. Passwords are never echoed back. Undoable.",
         )
         .cmd("protect.password")
         .with(schema(
             json!({
                 "doc": doc(),
-                "open_password": { "type": "string", "minLength": 1 },
-                "permissions_password": { "type": "string", "minLength": 1 },
-                "printing": { "type": "string", "enum": ["none", "low", "high"], "description": "Default high." },
-                "changes": { "type": "string", "enum": ["none", "pages", "fill-sign", "comment-fill-sign", "any-except-extract"], "description": "Default none." },
-                "copy": { "type": "boolean", "description": "Allow copying text and images (default false)." },
-                "accessibility": { "type": "boolean", "description": "Allow screen readers to read the text (default true)." },
+                "open_password": { "type": "string", "minLength": 1, "description": "Required to open the document. On its own it restricts nothing." },
+                "permissions_password": { "type": "string", "minLength": 1, "description": "Required to change security; enables printing/changes/copy/accessibility and their defaults." },
+                "printing": { "type": "string", "enum": ["none", "low", "high"], "description": "Needs permissions_password. Default high." },
+                "changes": { "type": "string", "enum": ["none", "pages", "fill-sign", "comment-fill-sign", "any-except-extract"], "description": "Needs permissions_password. Default none." },
+                "copy": { "type": "boolean", "description": "Allow copying text and images (needs permissions_password; default false)." },
+                "accessibility": { "type": "boolean", "description": "Allow screen readers to read the text (needs permissions_password; default true)." },
                 "compatibility": { "type": "string", "enum": ["aes-256", "aes-128", "rc4-128", "rc4-40"], "description": "Default aes-256 (Acrobat X and later)." },
                 "encrypt_metadata": { "type": "boolean", "description": "Default true." },
             }),
@@ -745,7 +775,7 @@ pub fn tools() -> Vec<ToolDef> {
         t("form_merge_data", "Merge data files into spreadsheet", "Collect the field values of form data files (FDF, XFDF) or filled-in PDF forms into one CSV file at path: a column per field name, a row per file. Returns the row and column counts.")
             .cmd("form.merge_data")
             .with(schema(json!({ "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 }, "path": { "type": "string" } }), &["paths", "path"])),
-        t("js_run", "Run JavaScript", "Run Acrobat JavaScript in the document, as the JavaScript console does (or as push button `field`'s Mouse Up script when field is given). The form object model is available: this/getField, event, app, util, console, display, color, and the document-level scripts. Field changes and resetForm are applied as one undoable step; returns the script's alerts, console output, requests (print, page, url, submit) and error.")
+        t("js_run", "Run JavaScript", "Run Acrobat JavaScript in the document, as the JavaScript console does (or as push button `field`'s Mouse Up script when field is given; on a laid-out XFA form, `field` runs that button's XFA click script instead, JavaScript or FormCalc, which can add and remove rows and show or hide subforms). The form object model is available: this/getField, event, app, util, console, display, color, and the document-level scripts. Field changes and resetForm are applied as one undoable step; returns the script's alerts, console output, requests (print, page, url, submit) and error.")
             .cmd("tools.js_console")
             .with(schema(
                 json!({ "doc": doc(), "script": { "type": "string" }, "field": { "type": "string", "description": "Run as this button's Mouse Up event." } }),
@@ -885,6 +915,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "from": { "type": "string", "enum": ["blank", "images", "text"] },
                 "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                "dpi": { "type": "number", "minimum": 1, "maximum": 1200, "description": "For images: override the embedded resolution without resampling. 72 gives one point per pixel; omit to use each image's resolution (72 when absent)." },
                 "text": { "type": "string" },
                 "path": { "type": "string" },
                 "pages": { "type": "integer", "minimum": 1, "maximum": 10000 },
