@@ -11,6 +11,61 @@
 # Adobe-authored non-visual technical data allowed by AGENTS.md §1.1.
 
 [[asset]]
+path = "crates/ui-egui/src/i18n/zh-hans.tsv"
+title = "Simplified Chinese interface translation catalog"
+author = "PdfCraft contributors"
+source = "Contributor-original: clean-room translations of PdfCraft's English UI labels, no proprietary localisation resources"
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "translation"
+usage = "Simplified Chinese UI strings, compiled in by crates/ui-egui/src/i18n/mod.rs"
+sha256 = "1a39d1886fed368cc5e23c376505074b3955fd8bcbcd0678209126ce07a10a95"
+
+[[asset]]
+path = "crates/ui-egui/src/i18n/zh-hant.tsv"
+title = "Traditional Chinese (Taiwan) interface translation catalog"
+author = "PdfCraft contributors"
+source = "Contributor-original: clean-room translations of PdfCraft's English UI labels, no proprietary localisation resources"
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "translation"
+usage = "Traditional Chinese UI strings, compiled in by crates/ui-egui/src/i18n/mod.rs"
+sha256 = "0448bc95a4046ec6cee88b02faed799b1917c19fe0f47d30febb9eb6b5c3b3d8"
+
+[[asset]]
+path = "crates/ui-egui/src/i18n/cs.tsv"
+title = "Czech interface translation catalog"
+author = "PdfCraft contributors"
+source = "Contributor-original: clean-room translations of PdfCraft's English UI labels, no proprietary localisation resources"
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "translation"
+usage = "Czech UI strings, compiled in by crates/ui-egui/src/i18n/mod.rs"
+sha256 = "1137fb2a70a57314006cc245d413e44895815a1d65f42c1fb841fa2650de43d5"
+
+[[asset]]
+path = "crates/ui-egui/src/i18n/pt-br.tsv"
+title = "Brazilian Portuguese interface translation catalog"
+author = "PdfCraft contributors"
+source = "Contributor-original: clean-room translations of PdfCraft's English UI labels, no proprietary localisation resources"
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "translation"
+usage = "Brazilian Portuguese UI strings, compiled in by crates/ui-egui/src/i18n/mod.rs"
+sha256 = "0ee4d2f630623ef7e06413a7c34a4a0269a2600fba682f06988a1346be4d07a5"
+
+[[asset]]
+path = "crates/ui-egui/src/i18n/ja.tsv"
+title = "Japanese interface translation catalog"
+author = "PdfCraft contributors"
+source = "Contributor-original: clean-room translations of PdfCraft's English UI labels, no proprietary localisation resources"
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "translation"
+usage = "Japanese UI strings, compiled in by crates/ui-egui/src/i18n/mod.rs"
+sha256 = "b72162877bf38bbbb0849e9a5462b952517d9b4208b0b38c3da019cf1756ce1c"
+
+[[asset]]
 path = "assets/icons/accessibility.svg"
 title = "Lucide icon \"accessibility\""
 author = "Lucide Contributors (portions Cole Bemis, Feather)"

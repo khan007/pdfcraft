@@ -7,6 +7,13 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+/// Translate an English UI string into the current language (see [`i18n`]).
+macro_rules! tl {
+    ($s:expr) => {
+        $crate::i18n::t($s)
+    };
+}
+
 mod a11y_ui;
 mod actions_ui;
 pub mod canvas;
@@ -317,7 +324,8 @@ pub struct PdfCraftApp {
     /// Comment author, per-tool colours and widths, pin.
     pub comment_prefs: comments::CommentPrefs,
     pub theme: ThemeKind,
-    pub language: i18n::Language,
+    /// Interface language preference: `auto` (follow the system) or a code from [`i18n::LANGUAGES`].
+    pub language: String,
     /// Follow the operating system's light/dark setting.
     pub follow_system_theme: bool,
     pub dialog: Option<Dialog>,
@@ -429,6 +437,8 @@ pub struct PdfCraftApp {
     pending_theme: Option<ThemeKind>,
     styled: bool,
     fonts_ready: bool,
+    /// The installed fonts put the Simplified Chinese faces first (see `theme::font_definitions_for`).
+    fonts_hans: bool,
     /// The window title last sent to the platform.
     pub window_title: String,
     /// The UI control channel, when enabled (`--control`; off by default).
@@ -532,7 +542,7 @@ impl PdfCraftApp {
             quick_tool: QuickTool::Select,
             comment_prefs: Default::default(),
             theme: ThemeKind::Light,
-            language: i18n::Language::default(),
+            language: i18n::AUTO.to_string(),
             follow_system_theme: false,
             dialog: None,
             update_source: None,
@@ -605,6 +615,7 @@ impl PdfCraftApp {
             pending_theme: None,
             styled: false,
             fonts_ready: false,
+            fonts_hans: false,
             control: None,
             bookmark_rename: None,
             last_opened_url: None,
@@ -742,10 +753,10 @@ impl PdfCraftApp {
         match f.bytes() {
             Ok(bytes) => {
                 if let Err(e) = self.open_bytes(&name, None, bytes) {
-                    self.notify(format!("Couldn't open {name}: {e}"));
+                    self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e.to_string())]);
                 }
             }
-            Err(e) => self.notify(format!("Couldn't read {name}: {e}")),
+            Err(e) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", &name), ("e", &e.to_string())]),
         }
     }
 
@@ -771,22 +782,22 @@ impl PdfCraftApp {
         let Some(att) = d.info.attachments.get(index).cloned() else { return };
         let data = pdfcraft_render::attachment_data(&d.bytes, d.password.as_deref(), &att);
         match (data, open) {
-            (Err(e), _) => self.notify(format!("Couldn't read {}: {e}", att.name)),
+            (Err(e), _) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", &att.name), ("e", &e.to_string())]),
             (Ok(bytes), true) => {
                 if let Err(e) = self.open_bytes(&att.name, None, bytes) {
-                    self.notify(format!("Couldn't open {}: {e}", att.name));
+                    self.notify_fmt("Couldn't open {name}: {e}", &[("name", &att.name), ("e", &e.to_string())]);
                 }
             }
             (Ok(bytes), false) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(path) = rfd::FileDialog::new().set_file_name(&att.name).save_file() {
                     match std::fs::write(&path, &bytes) {
-                        Ok(()) => self.notify(format!("Saved {}", path.display())),
-                        Err(e) => self.notify(format!("Couldn't save: {e}")),
+                        Ok(()) => self.notify_fmt("Saved {name}", &[("name", &path.display().to_string())]),
+                        Err(e) => self.notify_fmt("Couldn't save: {e}", &[("e", &e.to_string())]),
                     }
                 }
                 #[cfg(target_arch = "wasm32")]
-                self.notify(format!("Downloading attachments on the web arrives with M3.10 ({} bytes ready)", bytes.len()));
+                self.notify_fmt("Downloading attachments on the web arrives with M3.10 ({n} bytes ready)", &[("n", &bytes.len().to_string())]);
             }
         }
     }
@@ -802,7 +813,7 @@ impl PdfCraftApp {
         let Some(p) = self.password_prompt.take() else { return };
         let Some(pw) = password else { return };
         match self.try_open(&p.name, p.path, p.bytes, Some(&pw)) {
-            Err(e) => self.notify(format!("Couldn't open {}: {e}", p.name)),
+            Err(e) => self.notify_fmt("Couldn't open {name}: {e}", &[("name", &p.name), ("e", &e.to_string())]),
             // A recovered encrypted document is open once the prompt is gone.
             Ok(()) if self.password_prompt.is_none() => {
                 if let Some(meta) = self.pending_recovered.clone() {
@@ -819,10 +830,10 @@ impl PdfCraftApp {
         match std::fs::read(path) {
             Ok(bytes) => {
                 if let Err(e) = self.open_bytes(&name, Some(path.to_string()), bytes) {
-                    self.notify(format!("Couldn't open {name}: {e}"));
+                    self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e.to_string())]);
                 }
             }
-            Err(e) => self.notify(format!("Couldn't read {name}: {e}")),
+            Err(e) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", &name), ("e", &e.to_string())]),
         }
     }
 
@@ -830,7 +841,7 @@ impl PdfCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.pick(
             pickers::PickFor::Open,
-            rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).add_filter("Images and text (converted to PDF)", &create_ui::CONVERTIBLE),
+            rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).add_filter(tl!("Images and text (converted to PDF)"), &create_ui::CONVERTIBLE),
             false,
         );
         // Browsers pick files asynchronously; the bytes arrive through `inbox`.
@@ -838,8 +849,11 @@ impl PdfCraftApp {
         {
             let inbox = self.inbox.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if let Some(h) =
-                    rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).add_filter("Images and text", &create_ui::CONVERTIBLE).pick_file().await
+                if let Some(h) = rfd::AsyncFileDialog::new()
+                    .add_filter("PDF", &["pdf"])
+                    .add_filter(tl!("Images and text"), &create_ui::CONVERTIBLE)
+                    .pick_file()
+                    .await
                 {
                     let bytes = h.read().await;
                     if let Ok(mut q) = inbox.lock() {
@@ -896,10 +910,10 @@ impl PdfCraftApp {
                     self.pending_link = Some(PendingLink { url, origin });
                 }
             }
-            Err(e) => self.notify(format!(
-                "{} in this document tried to open an address PdfCraft won't open: {e}. Only web (http, https) and email (mailto) links open from documents.",
-                origin.noun()
-            )),
+            Err(e) => self.notify_fmt(
+                "{who} in this document tried to open an address PdfCraft won't open: {e}. Only web (http, https) and email (mailto) links open from documents.",
+                &[("who", tl!(origin.noun())), ("e", &e.to_string())],
+            ),
         }
     }
 
@@ -914,6 +928,22 @@ impl PdfCraftApp {
 
     pub fn notify(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), 0.0));
+    }
+
+    /// Notify with a static message in the UI language.
+    pub fn notify_tr(&mut self, text: &str) {
+        self.notify(tl!(text).to_string());
+    }
+
+    /// Notify with an error's own text. Engine and OS messages are not translated: matching their
+    /// English wording would break silently whenever it changes.
+    pub fn notify_error(&mut self, error: impl std::fmt::Display) {
+        self.notify(error.to_string());
+    }
+
+    /// Notify with a `{name}`-style template in the UI language (placeholders filled once).
+    pub fn notify_fmt(&mut self, template: &str, args: &[(&str, &str)]) {
+        self.notify(i18n::fmt(tl!(template), args));
     }
 
     pub fn set_theme(&mut self, ctx: &egui::Context, kind: ThemeKind) {
@@ -933,12 +963,12 @@ impl PdfCraftApp {
             .flat_map(|g| g.sections.iter().flat_map(|s| s.items.iter()))
             .find(|i| i.command == command)
             .map(|i| match i.availability {
-                pdfcraft_engine::catalog::Availability::Planned(m) => format!("ships in milestone {m}"),
-                pdfcraft_engine::catalog::Availability::Provider => "needs an AI provider (off by default)".to_string(),
-                pdfcraft_engine::catalog::Availability::Ready => "is available".to_string(),
+                pdfcraft_engine::catalog::Availability::Planned(m) => crate::i18n::fmt(tl!("ships in milestone {m}"), &[("m", m)]),
+                pdfcraft_engine::catalog::Availability::Provider => tl!("needs an AI provider (off by default)").to_string(),
+                pdfcraft_engine::catalog::Availability::Ready => tl!("is available").to_string(),
             })
-            .unwrap_or_else(|| "is not available yet".into());
-        self.notify(format!("`{command}` {when}"));
+            .unwrap_or_else(|| tl!("is not available yet").to_string());
+        self.notify_fmt("`{command}` {when}", &[("command", command), ("when", &when)]);
     }
 
     /// Select the workspace and its matching tool panel, just like the mode bar.
@@ -991,8 +1021,8 @@ impl PdfCraftApp {
         if let Ok(mode) = serde_json::from_value::<Mode>(v["default_mode"].clone()) {
             self.default_mode = mode;
         }
-        if let Ok(language) = serde_json::from_value::<i18n::Language>(v["language"].clone()) {
-            self.language = language;
+        if let Some(language) = v["language"].as_str().and_then(i18n::normalize_pref) {
+            self.language = language.to_string();
         }
         // An empty or missing name keeps the login-name default; settings are untrusted, so the
         // name is cut to a sane length.
@@ -1036,7 +1066,11 @@ impl PdfCraftApp {
         let view = self.active.and_then(|i| self.views.get_mut(i));
         match (key, view) {
             ("language", _) => {
-                self.language = i18n::Language::parse(value).ok_or("language must be en or ja")?;
+                let language = i18n::normalize_pref(value).ok_or_else(|| {
+                    let codes: Vec<&str> = std::iter::once(i18n::AUTO).chain(i18n::Lang::all().map(i18n::Lang::code)).collect();
+                    format!("language must be one of {}", codes.join(", "))
+                })?;
+                self.language = language.to_string();
             }
             ("theme", _) => {
                 self.follow_system_theme = value == "system";
@@ -1262,13 +1296,24 @@ impl eframe::App for PdfCraftApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
+        // Notices raised outside `ui` (opened files, OS events, the control channel) translate too.
+        let lang = i18n::Lang::from_pref(&self.language);
+        i18n::set_current(lang);
+        // Simplified Chinese wants its own faces before the Japanese ones (one baseline per line).
+        let hans = lang.code() == "zh-hans";
         if !self.styled {
             egui_extras::install_image_loaders(ctx);
-            theme::install_fonts(ctx);
+            theme::install_fonts_for(ctx, hans);
+            self.fonts_hans = hans;
             theme::apply(ctx, self.theme);
             self.styled = true;
         } else {
             self.fonts_ready = true;
+            if hans != self.fonts_hans {
+                // Same family names as before, so named fonts stay valid while the new set loads.
+                theme::install_fonts_for(ctx, hans);
+                self.fonts_hans = hans;
+            }
         }
         if let Some(k) = self.pending_theme.take() {
             self.set_theme(ctx, k);
@@ -1288,7 +1333,7 @@ impl eframe::App for PdfCraftApp {
         let arrived: Vec<(String, Vec<u8>)> = self.inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
         for (name, bytes) in arrived {
             if let Err(e) = self.open_bytes(&name, None, bytes) {
-                self.notify(format!("Couldn't open {name}: {e}"));
+                self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e.to_string())]);
             }
         }
         let os_events = self.os_events.as_mut().map(|poll| poll()).unwrap_or_default();
@@ -1336,6 +1381,7 @@ impl eframe::App for PdfCraftApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        i18n::set_current(i18n::Lang::from_pref(&self.language));
         // Fonts registered via set_fonts only take effect next frame; named families would panic now.
         if !self.fonts_ready {
             ctx.request_repaint();
