@@ -1,0 +1,61 @@
+# Fork-only Windows build: the Windows job from release.yml without the `release` environment,
+# signing secrets or the macOS job (which needs storytold's self-hosted runner). Produces unsigned
+# MSI installers and portable zips as workflow artifacts. Run it from the Actions tab or with
+# `gh workflow run windows-build.yml -f arch=x64`.
+name: Windows build
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Architecture to build"
+        type: choice
+        options: [x64, x86, arm64, all]
+        default: x64
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  PDFCRAFT_BUILD_SHA: ${{ github.sha }}
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.arch == 'all' && '["x64","x86","arm64"]' || format('["{0}"]', inputs.arch)) }}
+    steps:
+      - uses: actions/checkout@v4
+      # The craft-fonts build input (Japanese fonts), pinned to the same commit as release.yml.
+      - name: Check out craft-fonts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc,aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-build-${{ matrix.arch }}
+      - name: Install WiX
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Build and package (unsigned)
+        shell: pwsh
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: ./packaging/windows/package.ps1 -Arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/release/*
+          if-no-files-found: error
